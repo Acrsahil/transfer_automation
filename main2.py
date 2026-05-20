@@ -16,18 +16,34 @@ load_dotenv(dotenv_path=Path('.env').resolve(), override=True)
 # CONFIG — edit these or set in .env
 # =============================================================================
 
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
+DB_HOST     = os.getenv("DB_HOST")
+DB_NAME     = os.getenv("DB_NAME")
+DB_USER     = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_PORT = os.getenv("DB_PORT", 5432)
-
+DB_PORT     = os.getenv("DB_PORT", 5432)
 
 LOCATION_NAMES = [l.strip() for l in os.getenv(
     "LOCATION_NAMES", "JS-ch/Stockz").split(",")]
+
+# ADU_PERIOD_DAYS  — the rolling window used as the DII denominator
+#                    (passed to SQL as %(period_days)s)
 ADU_PERIOD_DAYS = int(os.getenv("ADU_PERIOD_DAYS", 30))
+
+# SALES_PERIOD_DAYS — how many calendar days back to look for sales/moves.
+#                     Defaults to ADU_PERIOD_DAYS when not set.
+SALES_PERIOD_DAYS = int(os.getenv("SALES_PERIOD_DAYS", ADU_PERIOD_DAYS))
+
+# SALES_END_DATE — optional upper bound for the sales window (YYYY-MM-DD).
+#                  Defaults to today when not set.
+_sales_end_raw = os.getenv("SALES_END_DATE")
+SALES_END_DATE = (
+    datetime.strptime(_sales_end_raw, "%Y-%m-%d")
+    if _sales_end_raw
+    else datetime.now()
+)
+
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "adu_dii_results.xlsx")
-BATCH_SIZE = 500
+BATCH_SIZE  = 500
 
 # =============================================================================
 # LOGGING
@@ -324,9 +340,9 @@ HEADERS = [
 
 HEADER_FILL = PatternFill("solid", start_color="2F4F8F")
 HEADER_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-DATA_FONT = Font(name="Arial", size=10)
+DATA_FONT   = Font(name="Arial", size=10)
 CENTER_ALIGN = Alignment(horizontal="center", vertical="center")
-LEFT_ALIGN = Alignment(horizontal="left",   vertical="center")
+LEFT_ALIGN   = Alignment(horizontal="left",   vertical="center")
 
 COL_WIDTHS = [12, 20, 12, 14, 40, 12, 12, 12, 12, 12, 18, 12, 12, 14, 20]
 
@@ -347,8 +363,8 @@ class ExcelWriter:
     def _write_header(self):
         for col_idx, (header, width) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
             cell = self.ws.cell(row=1, column=col_idx, value=header)
-            cell.font = HEADER_FONT
-            cell.fill = HEADER_FILL
+            cell.font      = HEADER_FONT
+            cell.fill      = HEADER_FILL
             cell.alignment = CENTER_ALIGN
             self.ws.column_dimensions[get_column_letter(col_idx)].width = width
         self.ws.freeze_panes = "A2"
@@ -363,14 +379,14 @@ class ExcelWriter:
     def append_rows(self, rows: list):
         for row in rows:
             status = stock_status(row["dii_value"])
-            row["stock_status"] = status
+            row["stock_status"]  = status
             row["calculated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             fill = STATUS_FILLS.get(status)
 
             values = [self._to_scalar(row.get(col)) for col in CSV_COLUMNS]
             for col_idx, value in enumerate(values, 1):
                 cell = self.ws.cell(row=self._row, column=col_idx, value=value)
-                cell.font = DATA_FONT
+                cell.font      = DATA_FONT
                 cell.alignment = LEFT_ALIGN
                 if fill:
                     cell.fill = fill
@@ -407,7 +423,22 @@ def calculate_batch(cr, location_ids, dest_location_ids, start_date, end_date,
 # PER-LOCATION ORCHESTRATOR  — writes to Excel after each batch
 # =============================================================================
 
-def calculate_for_location(cr, location: dict, period_days: int, writer: ExcelWriter) -> int:
+def calculate_for_location(
+    cr,
+    location: dict,
+    period_days: int,
+    writer: ExcelWriter,
+    *,
+    sales_period_days: int,
+    sales_end_date: datetime,
+) -> int:
+    """
+    Parameters
+    ----------
+    period_days       : ADU denominator window (passed as %(period_days)s to SQL).
+    sales_period_days : Calendar days to look back for sales/moves.
+    sales_end_date    : Upper bound of the sales window (inclusive).
+    """
     loc_name = location["complete_name"]
     _logger.info("Processing: %s (id=%s)", loc_name, location["id"])
     t0 = time.time()
@@ -415,15 +446,18 @@ def calculate_for_location(cr, location: dict, period_days: int, writer: ExcelWr
     dest_location_ids, picking_codes = get_dest_locations_and_picking_codes(
         cr, loc_name)
     outgoing_picking_type_ids = get_picking_type_ids(cr, picking_codes)
-    child_ids = get_all_child_location_ids(cr, location["id"])
+    child_ids    = get_all_child_location_ids(cr, location["id"])
     location_ids = tuple([location["id"]] + child_ids)
 
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=period_days - 1)
+    end_date   = sales_end_date
+    start_date = end_date - timedelta(days=sales_period_days - 1)
 
     _logger.info(
-        "  %d location ID(s) | %s to %s | picking=%s",
-        len(location_ids), start_date.date(), end_date.date(), picking_codes
+        "  %d location ID(s) | sales %s → %s (%d days) | ADU window %d days | picking=%s",
+        len(location_ids),
+        start_date.date(), end_date.date(), sales_period_days,
+        period_days,
+        picking_codes,
     )
 
     cr.execute("""
@@ -450,14 +484,14 @@ def calculate_for_location(cr, location: dict, period_days: int, writer: ExcelWr
 
         # ── Enrich rows with location metadata before writing ──
         for row in rows:
-            row["location_id"] = location["id"]
+            row["location_id"]   = location["id"]
             row["location_name"] = loc_name
 
         # ── Write this batch to Excel immediately ──────────────
         writer.append_rows(rows)
         written += len(rows)
-        _logger.info("  → %d rows written to Excel (total so far: %d)", len(
-            rows), writer.total_rows())
+        _logger.info("  → %d rows written to Excel (total so far: %d)",
+                     len(rows), writer.total_rows())
 
     _logger.info("  %d products | %.0f ms", written, (time.time() - t0) * 1000)
     return written
@@ -470,12 +504,14 @@ def calculate_for_location(cr, location: dict, period_days: int, writer: ExcelWr
 def run():
     _logger.info(
         "Connecting (read-only): %(dbname)s @ %(host)s:%(port)s", DB_CONFIG)
-    _logger.info("Locations : %s", LOCATION_NAMES)
-    _logger.info("ADU period: %d days", ADU_PERIOD_DAYS)
-    _logger.info("Output    : %s", OUTPUT_FILE)
+    _logger.info("Locations    : %s", LOCATION_NAMES)
+    _logger.info("ADU period   : %d days  (DII denominator window)", ADU_PERIOD_DAYS)
+    _logger.info("Sales period : %d days  (lookback for moves/sales)", SALES_PERIOD_DAYS)
+    _logger.info("Sales end    : %s", SALES_END_DATE.date())
+    _logger.info("Output       : %s", OUTPUT_FILE)
 
     writer = ExcelWriter(OUTPUT_FILE)
-    conn = get_connection()
+    conn   = get_connection()
 
     try:
         with conn.cursor() as cr:
@@ -485,7 +521,11 @@ def run():
                     _logger.warning(
                         "Location not found: '%s' — skipping.", loc_name)
                     continue
-                calculate_for_location(cr, location, ADU_PERIOD_DAYS, writer)
+                calculate_for_location(
+                    cr, location, ADU_PERIOD_DAYS, writer,
+                    sales_period_days=SALES_PERIOD_DAYS,
+                    sales_end_date=SALES_END_DATE,
+                )
     finally:
         conn.close()
 
@@ -499,7 +539,8 @@ def run():
     # Count statuses from sheet (no second pass needed — just read column 14)
     counts = {"critical": 0, "low": 0,
               "healthy": 0, "overstock": 0, "no_sales": 0}
-    for row in writer.ws.iter_rows(min_row=2, max_row=writer.ws.max_row, min_col=14, max_col=14):
+    for row in writer.ws.iter_rows(
+            min_row=2, max_row=writer.ws.max_row, min_col=14, max_col=14):
         status = row[0].value
         if status in counts:
             counts[status] += 1
