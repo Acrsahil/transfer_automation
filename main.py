@@ -25,11 +25,11 @@ DB_CONFIG = {
 # ─────────────────────────────────────────────
 PERIOD_DAYS = 7
 LOCATION_IDS = (5,)
-LOCATION_ID = 5
-DEST_LOCATION_IDS = (8,)
+LOCATION_ID = 6285
+DEST_LOCATION_IDS = (5,)
 PICKING_TYPE_IDS = (3,)
 MIN_PROD_ID = 1
-MAX_PROD_ID = 9999999
+MAX_PROD_ID = 999
 
 END_DATE = datetime.now()
 START_DATE = END_DATE - timedelta(days=PERIOD_DAYS - 1)

@@ -1,3 +1,4 @@
 psycopg2-binary
 openpyxl
 python-dotenv
+pandas
